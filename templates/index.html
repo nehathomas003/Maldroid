@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>APK Malware Detection</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f4f4;
+            margin: 0;
+            padding: 20px;
+            text-align: center;
+        }
+        .container {
+            max-width: 600px;
+            margin: auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+        h1, h2, h3, h4 {
+            color: #333;
+        }
+        label {
+            font-weight: bold;
+            display: block;
+            margin: 10px 0 5px;
+        }
+        input, select, button {
+            width: 100%;
+            padding: 10px;
+            margin: 5px 0 15px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        button {
+            background-color: #28a745;
+            color: white;
+            cursor: pointer;
+            border: none;
+        }
+        button:hover {
+            background-color: #218838;
+        }
+        .results {
+            margin-top: 20px;
+            text-align: left;
+        }
+        .permissions, .graphs {
+            margin-top: 15px;
+        }
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+        ul li {
+            background: #e9ecef;
+            margin: 5px 0;
+            padding: 8px;
+            border-radius: 5px;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            margin-top: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Maldroid--APK Malware Detection</h1>
+        <form method="POST" enctype="multipart/form-data">
+            <label for="malware_dir">Malware Directory:</label>
+            <input type="text" name="malware_dir" required>
+
+            <label for="benign_dir">Benign Directory:</label>
+            <input type="text" name="benign_dir" required>
+
+            <label for="dynamic_analysis_dir">Dynamic Analysis Directory:</label>
+            <input type="text" name="dynamic_analysis_dir" required>
+
+            <label for="file">Upload APK:</label>
+            <input type="file" name="file" accept=".apk" required>
+
+            <label for="algorithm">Choose Algorithm:</label>
+            <select name="algorithm">
+                <option value="Neural Network">Neural Network</option>
+                <option value="Support Vector Classifier">Support Vector Classifier</option>
+                <option value="Ensemble Model">Ensemble Model</option>
+            </select>
+
+            <button type="submit">Classify</button>
+        </form>
+        
+        {% if result %}
+            <div class="results">
+                <h2>Classification Result: {{ result }}</h2>
+                <p><strong>Accuracy:</strong> {{ accuracy }}</p>
+                <p><strong>App Name:</strong> {{ name }}</p>
+                <p><strong>SDK Version:</strong> {{ sdk }}</p>
+                <p><strong>Size:</strong> {{ size }}</p>
+            </div>
+            
+            <div id="dynamic-results">
+                <h2>Dynamic Analysis Results</h2>
+                {% if analysis_result %}
+                    <p>{{ analysis_result }}</p>
+                {% else %}
+                    <p>No analysis performed yet.</p>
+                {% endif %}
+            </div>
+
+            <div class="permissions">
+                <h3>Permissions Used:</h3>
+                {% for category, perms in categorized_permissions.items() %}
+                    <h4>{{ category }}:</h4>
+                    <ul>
+                        {% for perm in perms %}
+                            <li>{{ perm }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endfor %}
+            </div>
+            
+            <div class="graphs">
+                <h3>Permission Analysis Graphs:</h3>
+                {% if plot_url %}
+                    <img src="{{ plot_url }}" alt="Bar Chart">
+                {% endif %}
+                {% if pie_url %}
+                    <img src="{{ pie_url }}" alt="Pie Chart">
+                {% endif %}
+            </div>
+        {% endif %}
+    </div>
+</body>
+</html>

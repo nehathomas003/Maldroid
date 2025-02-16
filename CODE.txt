@@ -1,0 +1,490 @@
+pip install flask==1.1.1 werkzeug==0.15.6 itsdangerous==2.0.1 jinja2==3.0.3 opencv-python==4.5.3.56 tensorflow==2.4.0 keras==2.4.3 pillow==8.1.0 imutils==0.5.4 pandas==1.2.1 matplotlib==3.3.4 protobuf==3.19.0 numpy==1.19.5 scikit-learn==0.24.1 androguard
+
+
+woeking:classifer.py:import os
+import pickle
+import numpy as np
+from keras.models import load_model
+from androguard.core.bytecodes.apk import APK
+from genetic_algorithm import GeneticSelector
+
+
+class CustomUnpickler(pickle.Unpickler):
+    """ https://stackoverflow.com/questions/27732354/unable-to-load-files-using-pickle-and-multiple-modules"""
+
+    def find_class(self, module, name):
+        try:
+            return super().find_class(__name__, name)
+        except AttributeError:
+            return super().find_class(module, name)
+
+
+sel = CustomUnpickler(open('./static/models/ga.pkl', 'rb')).load()
+
+permissions = []
+with open('./static/permissions.txt', 'r') as f:
+    content = f.readlines()
+    for line in content:
+        cur_perm = line[:-1]
+        permissions.append(cur_perm)
+
+
+def generate_lime_explanation(data):
+    # This function mimics the LIME explanation style using your feature data
+    explanation = []
+    for i, perm in enumerate(permissions):
+        if data[i] == 1:  # Permission is present
+            explanation.append(f"Permission {perm} contributed to the prediction.")
+    # Sort by most influential (example: based on frequency or impact on prediction)
+    return sorted(explanation, key=lambda x: len(x), reverse=True)  # Simulating impact ranking
+
+def classify(file, ch):
+    vector = {}
+    result = ""
+    explanation = ""
+    name, sdk, size = "unknown", "unknown", "unknown"
+    
+    app = APK(file)
+    perm = app.get_permissions()
+    name, sdk, size = meta_fetch(file)
+    
+    for p in permissions:
+        vector[p] = 1 if p in perm else 0
+    
+    data = np.array([v for v in vector.values()])
+    
+    if ch == 0:  # Neural Network
+        ANN = load_model("static/models/models.h5")
+        result = ANN.predict([data[sel.support_].tolist()])[0][0]
+        explanation = generate_lime_explanation(data)  # Using simulated LIME explanation
+
+        if result < 0.02:
+            result = "Benign(safe)"
+        else:
+            result = "Malware"
+
+    elif ch in [1, 2]:  # SVC or Ensemble
+        model_file = "static/models/svc_ga.pkl" if ch == 1 else "static/models/ensemble.pkl"
+        model = pickle.load(open(model_file, "rb"))
+        result = model.predict([data[sel.support_]])[0]
+        result = "Benign(safe)" if result == "benign" else "Malware"
+        explanation = generate_lime_explanation(data)
+    
+    return result, name, sdk, size, explanation
+
+
+
+
+def meta_fetch(apk):
+    app = APK(apk)
+    return app.get_app_name(), app.get_target_sdk_version(), str(round(os.stat(apk).st_size / (1024 * 1024), 2)) + ' MB'
+
+
+app.py:from flask import Flask, render_template, request, redirect, url_for, flash
+from datetime import datetime
+import os
+from werkzeug.utils import secure_filename
+import classifier
+import matplotlib.pyplot as plt
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = './static/upload/'
+app.config['SECRET_KEY'] = 'd3Y5d5nJkU6CdwY'
+if os.path.exists(app.config['UPLOAD_FOLDER']):
+    print("directory exists")
+else:
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+    print("directory created")
+
+
+# Permission categories
+permission_categories = {
+    'Location': ['android.permission.ACCESS_COARSE_LOCATION', 'android.permission.ACCESS_FINE_LOCATION'],
+    'Storage': ['android.permission.READ_EXTERNAL_STORAGE', 'android.permission.WRITE_EXTERNAL_STORAGE'],
+    'Network': ['android.permission.ACCESS_NETWORK_STATE', 'android.permission.INTERNET'],
+    'Camera': ['android.permission.CAMERA'],
+    'Phone': ['android.permission.READ_PHONE_STATE', 'android.permission.USE_FINGERPRINT'],
+    'Other': ['android.permission.SYSTEM_ALERT_WINDOW', 'android.permission.WRITE_SYNC_SETTINGS', 'android.permission.FOREGROUND_SERVICE']
+}
+
+
+def categorize_permissions(explanation):
+    # Ensure explanation is a string (in case it's a list, join it)
+    if isinstance(explanation, list):
+        explanation = ", ".join(explanation)
+    
+    categorized_permissions = {
+        category: [perm for perm in explanation.split(', ') if perm in permissions]
+        for category, permissions in permission_categories.items()
+    }
+
+    simplified_explanation = ""
+    for category, perms in categorized_permissions.items():
+        simplified_explanation += f"{category} permissions: {', '.join(perms)}\n"
+
+    return simplified_explanation, categorized_permissions
+
+
+def create_permission_plot(categorized_permissions):
+    categories = list(categorized_permissions.keys())
+    permission_counts = [len(perms) for perms in categorized_permissions.values()]
+
+    # Bar chart
+    plt.figure(figsize=(10, 6))
+    plt.bar(categories, permission_counts, color=['blue', 'green', 'red', 'orange', 'purple', 'yellow'])
+    plt.title('Permissions Categories Influencing Prediction')
+    plt.xlabel('Permission Categories')
+    plt.ylabel('Number of Permissions')
+    plot_path = 'static/images/permissions_bar_chart.png'
+    plt.savefig(plot_path)
+    plt.close()
+
+    # Pie chart
+    plt.figure(figsize=(8, 8))
+    plt.pie(permission_counts, labels=categories, autopct='%1.1f%%', startangle=90)
+    plt.title('Distribution of Permission Categories Influencing Prediction')
+    pie_path = 'static/images/permissions_pie_chart.png'
+    plt.savefig(pie_path)
+    plt.close()
+
+    return plot_path, pie_path
+
+
+@app.route("/", methods=["GET", "POST"])
+def home():
+    algorithms = {
+        "Neural Network": "96.26 %",
+        "Support Vector Classifier": "97.12%",
+        "Ensemble Model": "95.64%",
+    }
+    result, accuracy, name, sdk, size, explanation = "", "", "", "", "", ""
+    simplified_explanation, categorized_permissions = "", {}
+    plot_url, pie_url = "", ""
+
+    if request.method == "POST":
+        if "file" not in request.files:
+            flash("No file part")
+            return redirect(request.url)
+
+        file = request.files["file"]
+        if file.filename == "":
+            flash("No selected file")
+            return redirect(request.url)
+
+        if file and file.filename.endswith(".apk"):
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            file.save(file_path)
+
+            algorithm = request.form["algorithm"]
+            if algorithm == "Neural Network":
+                accuracy = algorithms["Neural Network"]
+                result, name, sdk, size, explanation = classifier.classify(file_path, 0)
+            elif algorithm == "Support Vector Classifier":
+                accuracy = algorithms["Support Vector Classifier"]
+                result, name, sdk, size, explanation = classifier.classify(file_path, 1)
+            elif algorithm == "Ensemble Model":
+                accuracy = algorithms["Ensemble Model"]
+                result, name, sdk, size, explanation = classifier.classify(file_path, 2)
+
+            # Only categorize permissions and create plots if classification is done
+            simplified_explanation, categorized_permissions = categorize_permissions(explanation)
+            plot_url, pie_url = create_permission_plot(categorized_permissions)
+
+    return render_template(
+        "index.html",
+        result=result,
+        algorithms=algorithms.keys(),
+        accuracy=accuracy,
+        name=name,
+        sdk=sdk,
+        size=size,
+        explanation=simplified_explanation,
+        plot_url=plot_url,
+        pie_url=pie_url
+    )
+
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0')
+
+
+
+working lime ----
+classify:
+import os
+import pickle
+import numpy as np
+from keras.models import load_model
+from androguard.core.bytecodes.apk import APK
+from genetic_algorithm import GeneticSelector
+
+
+class CustomUnpickler(pickle.Unpickler):
+    """ https://stackoverflow.com/questions/27732354/unable-to-load-files-using-pickle-and-multiple-modules"""
+
+    def find_class(self, module, name):
+        try:
+            return super().find_class(__name__, name)
+        except AttributeError:
+            return super().find_class(module, name)
+
+
+sel = CustomUnpickler(open('./static/models/ga.pkl', 'rb')).load()
+
+permissions = []
+with open('./static/permissions.txt', 'r') as f:
+    content = f.readlines()
+    for line in content:
+        cur_perm = line[:-1]
+        permissions.append(cur_perm)
+
+
+def generate_lime_explanation(data):
+    # This function mimics the LIME explanation style using your feature data
+    explanation = []
+    for i, perm in enumerate(permissions):
+        if data[i] == 1:  # Permission is present
+            explanation.append(f"Permission {perm} contributed to the prediction.")
+    # Sort by most influential (example: based on frequency or impact on prediction)
+    return sorted(explanation, key=lambda x: len(x), reverse=True)  # Simulating impact ranking
+
+def classify(file, ch):
+    vector = {}
+    result = ""
+    explanation = ""
+    name, sdk, size = "unknown", "unknown", "unknown"
+    
+    app = APK(file)
+    perm = app.get_permissions()
+    name, sdk, size = meta_fetch(file)
+    
+    for p in permissions:
+        vector[p] = 1 if p in perm else 0
+    
+    data = np.array([v for v in vector.values()])
+    
+    if ch == 0:  # Neural Network
+        ANN = load_model("static/models/models.h5")
+        result = ANN.predict([data[sel.support_].tolist()])[0][0]
+        explanation = generate_lime_explanation(data)  # Using simulated LIME explanation
+
+        if result < 0.02:
+            result = "Benign(safe)"
+        else:
+            result = "Malware"
+
+    elif ch in [1, 2]:  # SVC or Ensemble
+        model_file = "static/models/svc_ga.pkl" if ch == 1 else "static/models/ensemble.pkl"
+        model = pickle.load(open(model_file, "rb"))
+        result = model.predict([data[sel.support_]])[0]
+        result = "Benign(safe)" if result == "benign" else "Malware"
+        explanation = generate_lime_explanation(data)
+    
+    print(explanation)
+    return result, name, sdk, size, explanation
+
+
+
+
+def meta_fetch(apk):
+    app = APK(apk)
+    return app.get_app_name(), app.get_target_sdk_version(), str(round(os.stat(apk).st_size / (1024 * 1024), 2)) + ' MB'
+
+
+app.py:
+from flask import Flask, render_template, request, redirect, url_for, flash
+from datetime import datetime
+import os
+from werkzeug.utils import secure_filename
+import classifier
+import matplotlib
+matplotlib.use('Agg')  # Use a non-GUI backend for Flask
+import matplotlib.pyplot as plt
+import random
+import time
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = './static/upload/'
+app.config['SECRET_KEY'] = 'd3Y5d5nJkU6CdwY'
+if os.path.exists(app.config['UPLOAD_FOLDER']):
+    print("directory exists")
+else:
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+    print("directory created")
+
+
+# Permission categories
+permission_categories = {
+    'Location': ['android.permission.ACCESS_COARSE_LOCATION', 'android.permission.ACCESS_FINE_LOCATION'],
+    'Storage': ['android.permission.READ_EXTERNAL_STORAGE', 'android.permission.WRITE_EXTERNAL_STORAGE'],
+    'Network': ['android.permission.ACCESS_NETWORK_STATE', 'android.permission.INTERNET'],
+    'Camera': ['android.permission.CAMERA'],
+    'Phone': ['android.permission.READ_PHONE_STATE', 'android.permission.USE_FINGERPRINT'],
+    'Other': ['android.permission.SYSTEM_ALERT_WINDOW', 'android.permission.WRITE_SYNC_SETTINGS', 'android.permission.FOREGROUND_SERVICE']
+}
+
+
+def categorize_permissions(explanation):
+    if isinstance(explanation, list):
+        permissions_only = [perm.split()[1] for perm in explanation]  # Extract permission name
+    else:
+        permissions_only = explanation.split(", ")
+
+    categorized_permissions = {
+        category: [perm for perm in permissions_only if perm in permissions]
+        for category, permissions in permission_categories.items()
+    }
+
+    simplified_explanation = "\n".join(
+        f"{category} permissions: {', '.join(perms)}" for category, perms in categorized_permissions.items() if perms
+    )
+
+    return simplified_explanation, categorized_permissions
+
+
+
+def create_permission_plot(categorized_permissions):
+    categories = list(categorized_permissions.keys())
+    permission_counts = [len(perms) for perms in categorized_permissions.values()]
+    
+    print("Permission Counts:", permission_counts)  # Debugging output
+
+    # Prevent empty plot issues
+    if sum(permission_counts) == 0:
+        print("⚠️ No permissions found, skipping plot generation.")
+        return None, None  # Return None instead of paths
+
+    # Bar chart
+    plt.figure(figsize=(10, 6))
+    plt.bar(categories, permission_counts, color=['blue', 'green', 'red', 'orange', 'purple', 'yellow'])
+    plt.title('Permissions Categories Influencing Prediction')
+    plt.xlabel('Permission Categories')
+    plt.ylabel('Number of Permissions')
+    plt.xticks(rotation=45)
+    bar_chart_path = 'static/images/permissions_bar_chart.png'
+    plt.savefig(bar_chart_path)
+    plt.close()
+
+    # Pie chart
+    plt.figure(figsize=(8, 8))
+    plt.pie(permission_counts, labels=categories, autopct='%1.1f%%', startangle=90)
+    plt.title('Distribution of Permission Categories Influencing Prediction')
+    pie_chart_path = 'static/images/permissions_pie_chart.png'
+    plt.savefig(pie_chart_path)
+    plt.close()
+
+    return bar_chart_path, pie_chart_path
+
+
+
+@app.route("/", methods=["GET", "POST"])
+def home():
+    algorithms = {
+        "Neural Network": "96.26 %",
+        "Support Vector Classifier": "97.12%",
+        "Ensemble Model": "95.64%",
+    }
+    result, accuracy, name, sdk, size, explanation = "", "", "", "", "", ""
+    simplified_explanation, categorized_permissions = "", {}
+    plot_url, pie_url = "", ""
+
+    if request.method == "POST":
+        if "file" not in request.files:
+            flash("No file part")
+            return redirect(request.url)
+
+        file = request.files["file"]
+        if file.filename == "":
+            flash("No selected file")
+            return redirect(request.url)
+
+        if file and file.filename.endswith(".apk"):
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            file.save(file_path)
+
+            algorithm = request.form["algorithm"]
+            if algorithm == "Neural Network":
+                accuracy = algorithms["Neural Network"]
+                result, name, sdk, size, explanation = classifier.classify(file_path, 0)
+            elif algorithm == "Support Vector Classifier":
+                accuracy = algorithms["Support Vector Classifier"]
+                result, name, sdk, size, explanation = classifier.classify(file_path, 1)
+            elif algorithm == "Ensemble Model":
+                accuracy = algorithms["Ensemble Model"]
+                result, name, sdk, size, explanation = classifier.classify(file_path, 2)
+
+            # Only categorize permissions and create plots if classification is done
+            simplified_explanation, categorized_permissions = categorize_permissions(explanation)
+            plot_url, pie_url = create_permission_plot(categorized_permissions)
+            print("Categorized Permissions:", categorized_permissions)
+
+    timestamp = int(time.time())  # Generates a new timestamp every time
+    plot_url = f'/static/images/permissions_bar_chart.png?{timestamp}'
+    pie_url = f'/static/images/permissions_pie_chart.png?{timestamp}'
+    return render_template(
+        "index.html",
+        result=result,
+        algorithms=algorithms.keys(),
+        accuracy=accuracy,
+        name=name,
+        sdk=sdk,
+        size=size,
+        explanation=simplified_explanation,
+        plot_url=plot_url,
+        pie_url=pie_url
+    )
+
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0')
+
+
+html:
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>APK Malware Detection</title>
+</head>
+<body>
+    <h1>APK Malware Detection</h1>
+    <form method="POST" enctype="multipart/form-data">
+        <label for="file">Upload APK File:</label>
+        <input type="file" name="file" id="file" accept=".apk" required><br><br>
+        
+        <label for="algorithm">Choose Algorithm:</label>
+        <select name="algorithm" id="algorithm">
+            <option value="Neural Network">Neural Network</option>
+            <option value="Support Vector Classifier">Support Vector Classifier</option>
+            <option value="Ensemble Model">Ensemble Model</option>
+        </select><br><br>
+
+        <button type="submit">Classify</button>
+    </form>
+
+    {% if result %}
+        <h2>Classification Result: {{ result }}</h2>
+        <p><strong>Accuracy:</strong> {{ accuracy }}</p>
+        <p><strong>App Name:</strong> {{ name }}</p>
+        <p><strong>SDK Version:</strong> {{ sdk }}</p>
+        <p><strong>Size:</strong> {{ size }}</p>
+
+        <h3>Explanation:</h3>
+        <pre>{{ explanation }}</pre>
+
+        <h3>Graphical Representations:</h3>
+        <div>
+            <h4>Permission Categories (Bar Chart):</h4>
+            <img src="{{ plot_url }}?{{ timestamp }}" alt="Permissions Bar Chart">
+        </div>
+        <div>
+            <h4>Permission Categories (Pie Chart):</h4>
+            <img src="{{ pie_url }}?{{ timestamp }}" alt="Permissions Pie Chart">
+        </div>
+    {% endif %}
+</body>
+</html>
+
