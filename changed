@@ -1,0 +1,399 @@
+advance.py:
+import os
+import hashlib
+import threading
+import subprocess
+import time
+import sys
+from pathlib import Path
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import requests
+
+# Global directories (initially empty)
+DYNAMIC_ANALYSIS_DIR = ""
+
+# Lock for threading
+lock = threading.Lock()
+
+COORDINATOR_URL = "http://localhost:8000"  # Cuckoo's default web interface (change if needed)
+
+def set_directories(malware_dir, benign_dir, dynamic_analysis_dir):
+    """Set the global directories for malware, benign, and dynamic analysis."""
+    global MALWARE_DIR, BENIGN_DIR, DYNAMIC_ANALYSIS_DIR
+    MALWARE_DIR, BENIGN_DIR, DYNAMIC_ANALYSIS_DIR = malware_dir, benign_dir, dynamic_analysis_dir
+    print(f"Directories set:\n- Malware: {MALWARE_DIR}\n- Benign: {BENIGN_DIR}\n- Dynamic Analysis: {DYNAMIC_ANALYSIS_DIR}")
+
+    # Ensure directories exist
+    for directory in [MALWARE_DIR, BENIGN_DIR, DYNAMIC_ANALYSIS_DIR]:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+def run_dynamic_analysis(file_path):
+    """Run dynamic analysis on a file, using threading and a lock to prevent concurrent access."""
+    with lock:
+        t = threading.Thread(target=run_dynamic_analysis_thread, args=(file_path,))
+        t.start()
+
+def run_dynamic_analysis_thread(file_path):
+    """Thread function for performing dynamic analysis."""
+    file_name = Path(file_path).stem
+    output_dir = os.path.join(DYNAMIC_ANALYSIS_DIR, file_name)
+    
+    # Use Cuckoo's API to submit the file for dynamic analysis
+    submit_file_to_cuckoo(file_path, output_dir)
+
+def submit_file_to_cuckoo(file_path, output_dir):
+    """Submit a file to Cuckoo for dynamic analysis using Cuckoo's API."""
+    try:
+        # Create the payload for submitting to the Cuckoo API
+        files = {'file': open(file_path, 'rb')}
+        data = {
+            'priority': 0,  # Set priority as needed
+        }
+
+        # Send the file to Cuckoo's API for analysis
+        response = requests.post(f"{COORDINATOR_URL}/tasks/create/file", files=files, data=data)
+        
+        if response.status_code == 200:
+            task_id = response.json().get('task_id')
+            print(f"File submitted for analysis. Task ID: {task_id}")
+            
+            # Monitor the task's progress
+            monitor_task_status(task_id, output_dir)
+        else:
+            print(f"Failed to submit file to Cuckoo. Error: {response.text}")
+    
+    except Exception as e:
+        print(f"Error submitting file to Cuckoo: {e}")
+
+def monitor_task_status(task_id, output_dir):
+    """Monitor the Cuckoo task until it completes and retrieve the result."""
+    try:
+        while True:
+            # Query Cuckoo's API to check the task's status
+            response = requests.get(f"{COORDINATOR_URL}/tasks/view/{task_id}")
+            
+            if response.status_code == 200:
+                task_info = response.json()
+                status = task_info.get('status')
+
+                if status == 'reported':  # Analysis complete
+                    print(f"Analysis complete for task ID: {task_id}")
+                    download_result(task_id, output_dir)
+                    break
+                elif status == 'pending':
+                    print(f"Analysis pending for task ID: {task_id}")
+                elif status == 'processing':
+                    print(f"Analysis processing for task ID: {task_id}")
+                else:
+                    print(f"Unknown status for task ID: {task_id}")
+                    break
+
+            else:
+                print(f"Failed to get task status. Error: {response.text}")
+                break
+            
+            time.sleep(5)  # Wait 5 seconds before checking again
+    
+    except Exception as e:
+        print(f"Error monitoring task status: {e}")
+
+def download_result(task_id, output_dir):
+    """Download the result of the analysis."""
+    try:
+        response = requests.get(f"{COORDINATOR_URL}/tasks/report/{task_id}")
+
+        if response.status_code == 200:
+            result_path = os.path.join(output_dir, f"{task_id}_result.json")
+            with open(result_path, 'wb') as result_file:
+                result_file.write(response.content)
+            print(f"Analysis result saved to {result_path}")
+        else:
+            print(f"Failed to download result. Error: {response.text}")
+    except Exception as e:
+        print(f"Error downloading result: {e}")
+
+def calculate_hash(file_path):
+    """Calculate the SHA-256 hash of a file."""
+    sha256 = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256.update(chunk)
+    except IOError:
+        print(f"Could not read file: {file_path}")
+        return None
+    return sha256.hexdigest()
+
+def analyze_file(file_path):
+    """Analyze a given file by running dynamic analysis and return the result."""
+    file_hash = calculate_hash(file_path)
+    
+    # Check if the file is already in the dynamic analysis directory
+    if os.path.exists(os.path.join(DYNAMIC_ANALYSIS_DIR, file_hash)):
+        print(f"File {file_path} has already been analyzed.")
+        return "Already analyzed"  # Return a placeholder if it's already analyzed
+    
+    # Run dynamic analysis on the file
+    print(f"Running dynamic analysis for: {file_path}")
+    run_dynamic_analysis(file_path)  # This runs the dynamic analysis asynchronously
+    
+    # We assume the result will be saved in a file named "<file_hash>_result.txt"
+    result_path = os.path.join(DYNAMIC_ANALYSIS_DIR, f"{file_hash}_result.json")
+
+    # Poll for the result file until it's available (max 10 minutes)
+    start_time = time.time()
+    while not os.path.exists(result_path):
+        elapsed_time = time.time() - start_time
+        if elapsed_time > 600:  # If it has been more than 10 minutes, exit
+            return "Analysis result not available after waiting for 10 minutes."
+        time.sleep(5)  # Check every 5 seconds
+    
+    # Read the result from the file once it's available
+    with open(result_path, "r") as result_file:
+        analysis_result = result_file.read()
+    
+    return analysis_result
+
+class FileEventHandler(FileSystemEventHandler):
+    """Handler for file system events, triggering analysis on new files."""
+    def on_created(self, event):
+        print(f"New file detected: {event.src_path}")
+        analyze_file(event.src_path)
+
+def start_observer():
+    """Start observing the directory for file changes."""
+    if not DYNAMIC_ANALYSIS_DIR:
+        print("Error: Dynamic Analysis directory not set. Call set_directories() first.")
+        return
+
+    observer = Observer()
+    event_handler = FileEventHandler()
+    
+    observer.schedule(event_handler, DYNAMIC_ANALYSIS_DIR, recursive=True)
+
+    print(f"Starting observer for: {DYNAMIC_ANALYSIS_DIR}")
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+
+if __name__ == "__main__":
+    """This script should only be executed when explicitly called with arguments."""
+    if len(sys.argv) == 2:
+        set_directories(sys.argv[1])
+        start_observer()
+    else:
+        print("Usage: python Advance.py <dynamic_analysis_dir>")
+        sys.exit(1)
+app.py:
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+import os
+import time
+import classifier
+import Advance
+from werkzeug.utils import secure_filename
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import subprocess
+from Advance import set_directories, analyze_file
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = './static/upload/'
+app.config['SECRET_KEY'] = 'd3Y5d5nJkU6CdwY'
+
+# Ensure upload folder exists
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+
+# Permission categories mapping
+permission_categories = {
+    'Location': {
+        'android.permission.ACCESS_COARSE_LOCATION': 'Approximate location access',
+        'android.permission.ACCESS_FINE_LOCATION': 'Precise location access'
+    },
+    'Storage': {
+        'android.permission.READ_EXTERNAL_STORAGE': 'Read external storage',
+        'android.permission.WRITE_EXTERNAL_STORAGE': 'Write to external storage',
+        'android.permission.READ_MEDIA_AUDIO': 'Read audio files',
+        'android.permission.READ_MEDIA_IMAGES': 'Read image files'
+    },
+    'Network': {
+        'android.permission.ACCESS_NETWORK_STATE': 'Access network state',
+        'android.permission.INTERNET': 'Full internet access',
+        'android.permission.CHANGE_WIFI_MULTICAST_STATE': 'Change WiFi multicast settings',
+        'android.permission.ACCESS_WIFI_STATE': 'Access WiFi state'
+    },
+    'Camera': {
+        'android.permission.CAMERA': 'Use camera'
+    },
+    'Phone': {
+        'android.permission.READ_PHONE_STATE': 'Read phone status and identity',
+        'android.permission.CALL_PHONE': 'Make phone calls',
+        'android.permission.USE_CREDENTIALS': 'Use account credentials'
+    },
+    'Bluetooth': {
+        'android.permission.BLUETOOTH': 'Basic Bluetooth operations',
+        'android.permission.BLUETOOTH_ADMIN': 'Manage Bluetooth settings',
+        'android.permission.BLUETOOTH_SCAN': 'Scan for Bluetooth devices',
+        'android.permission.BLUETOOTH_ADVERTISE': 'Advertise Bluetooth presence',
+        'android.permission.BLUETOOTH_CONNECT': 'Connect to Bluetooth devices'
+    },
+    'Audio': {
+        'android.permission.MODIFY_AUDIO_SETTINGS': 'Modify audio settings',
+        'android.permission.RECORD_AUDIO': 'Record audio'
+    },
+    'Notifications': {
+        'android.permission.POST_NOTIFICATIONS': 'Post notifications',
+        'android.permission.VIBRATE': 'Control vibration'
+    },
+    'Foreground Services': {
+        'android.permission.FOREGROUND_SERVICE': 'Run foreground services',
+        'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK': 'Foreground media playback',
+        'android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE': 'Foreground connected device service',
+        'android.permission.FOREGROUND_SERVICE_DATA_SYNC': 'Foreground data sync'
+    },
+    'Others': {
+        'android.permission.SYSTEM_ALERT_WINDOW': 'Draw over other apps',
+        'android.permission.NFC': 'Use NFC communication',
+        'android.permission.WAKE_LOCK': 'Prevent device from sleeping',
+        'com.spotify.music.permission.SECURED_BROADCAST': 'Spotify secured broadcast',
+        'com.sony.snei.np.android.account.provider.permission.DUID_READ_PROVIDER': 'Sony NP account read provider',
+        'com.android.vending.BILLING': 'In-app billing',
+        'android.permission.BROADCAST_STICKY': 'Send sticky broadcasts',
+        'com.spotify.music.permission.C2D_MESSAGE': 'Spotify cloud messaging',
+        'com.spotify.music.permission.INTERNAL_BROADCAST': 'Spotify internal broadcast',
+        'com.sec.android.app.clockpackage.permission.READ_ALARM': 'Read alarm data',
+        'com.samsung.WATCH_APP_TYPE.Companion': 'Samsung watch app companion',
+        'com.google.android.gms.permission.AD_ID': 'Google advertising ID access',
+        'com.samsung.android.samsungaccount.permission.ACCOUNT_MANAGER': 'Samsung account management',
+        'android.permission.RECEIVE_BOOT_COMPLETED': 'Start after boot',
+        'com.android.launcher.permission.INSTALL_SHORTCUT': 'Install home screen shortcuts',
+        'com.google.android.finsky.permission.BIND_GET_INSTALL_REFERRER_SERVICE': 'Install referrer service',
+        'com.google.android.apps.meetings.permission.MEET_LIVE_SHARING': 'Google Meet live sharing',
+        'android.permission.GET_ACCOUNTS': 'Access user accounts',
+        'com.google.android.c2dm.permission.RECEIVE': 'Receive cloud messages',
+        'com.spotify.music.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION': 'Spotify dynamic receiver',
+        'com.samsung.android.rubin.context.permission.READ_CONTEXT_MANAGER': 'Samsung context manager access'
+    }
+}
+
+def categorize_permissions(permissions):
+    categorized_permissions = {category: [] for category in permission_categories}
+    uncategorized = []
+
+    for perm in permissions:
+        found = False
+        for category, perm_dict in permission_categories.items():
+            if perm in perm_dict:
+                categorized_permissions[category].append(perm_dict[perm])
+                found = True
+                break
+        if not found:
+            uncategorized.append(perm)
+
+    if uncategorized:
+        categorized_permissions['Uncategorized'] = uncategorized
+
+    return categorized_permissions
+
+def create_permission_plot(categorized_permissions):
+    categories = list(categorized_permissions.keys())
+    permission_counts = [len(perms) for perms in categorized_permissions.values()]
+
+    if sum(permission_counts) == 0:
+        return None, None  
+
+    # Bar chart
+    plt.figure(figsize=(10, 6))
+    plt.bar(categories, permission_counts, color=['blue', 'green', 'red', 'orange', 'purple', 'yellow'])
+    plt.title('Permission Categories Used by APK')
+    plt.xlabel('Permission Categories')
+    plt.ylabel('Number of Permissions')
+    plt.xticks(rotation=45)
+    bar_chart_path = 'static/images/permissions_bar_chart.png'
+    plt.savefig(bar_chart_path)
+    plt.close()
+
+    # Pie chart
+    plt.figure(figsize=(8, 8))
+    plt.pie(permission_counts, labels=categories, autopct='%1.1f%%', startangle=90)
+    plt.title('Permission Category Distribution')
+    pie_chart_path = 'static/images/permissions_pie_chart.png'
+    plt.savefig(pie_chart_path)
+    plt.close()
+
+    return bar_chart_path, pie_chart_path
+
+@app.route("/", methods=["GET", "POST"])
+def home():
+    algorithms = {
+        "Neural Network": "96.26%",
+        "Support Vector Classifier": "97.12%",
+        "Ensemble Model": "95.64%",
+    }
+
+    result, accuracy, name, sdk, size, extracted_permissions = "", "", "", "", "", []
+    categorized_permissions = {}
+    plot_url, pie_url = None, None
+    analysis_result = None
+
+    if request.method == "POST":
+        malware_dir = request.form.get("malware_dir").strip()
+        benign_dir = request.form.get("benign_dir").strip()
+        dynamic_analysis_dir = request.form.get("dynamic_analysis_dir").strip()
+
+        for directory in [malware_dir, benign_dir, dynamic_analysis_dir]:
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+
+        if "file" not in request.files:
+            flash("No file part")
+            return redirect(request.url)
+
+        file = request.files["file"]
+        if file.filename == "":
+            flash("No selected file")
+            return redirect(request.url)
+
+        if file and file.filename.endswith(".apk"):
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            file.save(file_path)
+
+            set_directories(malware_dir, benign_dir, dynamic_analysis_dir)
+            analysis_result = analyze_file(file_path)  # Get the result of dynamic analysis
+
+            algorithm = request.form["algorithm"]
+            accuracy = algorithms[algorithm]
+            model_index = {"Neural Network": 0, "Support Vector Classifier": 1, "Ensemble Model": 2}[algorithm]
+
+            result, name, sdk, size, _, extracted_permissions = classifier.classify(file_path, model_index)
+
+            categorized_permissions = categorize_permissions(extracted_permissions)
+            plot_url, pie_url = create_permission_plot(categorized_permissions)
+
+    timestamp = int(time.time())
+    return render_template(
+        "index.html",
+        result=result,
+        algorithms=algorithms.keys(),
+        accuracy=accuracy,
+        name=name,
+        sdk=sdk,
+        size=size,
+        categorized_permissions=categorized_permissions,
+        plot_url=f"{plot_url}?{timestamp}" if plot_url else None,
+        pie_url=f"{pie_url}?{timestamp}" if pie_url else None,
+        analysis_result=analysis_result,  # Pass the analysis result to the template
+    )
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000)
